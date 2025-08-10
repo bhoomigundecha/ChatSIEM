@@ -26,7 +26,7 @@ Rules(for writing markup)
 React Fragment : Lets you group multiple components into a single entity (<> </>)
 
 JSX in curly braces : It becomes javascript
-eg. ***<p> 2*2 = {2*2} </p>***
+eg. *** 2*2 = {2*2} ***
 
 eg. ***let name = "bhoomi"***
 ***<p> {name} </p>***
