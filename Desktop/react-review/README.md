@@ -26,10 +26,12 @@ Rules(for writing markup)
 React Fragment : Lets you group multiple components into a single entity (<> </>)
 
 JSX in curly braces : It becomes javascript
-eg. *** 2*2 = {2*2} ***
+eg. 
+2*2 = {2*2} 
 
-eg. ***let name = "bhoomi"***
-***<p> {name} </p>***
+eg.
+let name = "bhoomi"
+<p> {name} </p>
 
 eg.
 
@@ -37,9 +39,11 @@ suppose classname cc
 
 function cc{
     return(
+        """
         <div className="cc">
             <h1>hello</h1>
         </div>
+        """
     )
 }
 
