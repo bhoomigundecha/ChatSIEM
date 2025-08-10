@@ -11,12 +11,16 @@ Command : npm create vite@latest
 
 import, export 
 (when you need to return a single value)
-***import Title from "./Title.jsx"***
-***export default Title***
+```javascript
+import Title from "./Title.jsx"
+export default Title
+```
 
 (otherwise)
-***import {Title} from "./Title.jsx"***
-***export {Title}***
+```javascript
+import {Title} from "./Title.jsx"
+export {Title}
+```
 
 Rules(for writing markup)
 1. Return a single root element 
@@ -30,13 +34,16 @@ eg.
 2*2 = {2*2} 
 
 eg.
+```javascript
 let name = "bhoomi"
 <p> {name} </p>
+```
 
 eg.
 
 suppose classname cc 
 
+```javascript
 function cc{
     return(
         """
@@ -46,13 +53,14 @@ function cc{
         """
     )
 }
+```
 
 this would be in our css 
-***
+```css
 .cc{
     border : 1px solid black
 }
-***
+```
 
 
 ### Module 2
@@ -61,9 +69,12 @@ React props : Props are the information that you pass to a JSX tag
 
 
 eg. 
-***<Title name="bhoomi" age="20"/>***
+```jsx
+<Title name="bhoomi" age="20"/>
+```
 
 eg. 
+```jsx
 <Product title="phone" price=30k/>
 
 export default function Product({title, product}){
@@ -73,10 +84,12 @@ export default function Product({title, product}){
         </div>
     )
 }
+```
 
 Passing arrays to props 
 
 Option 1 :
+```javascript
 import Product from './Product.js'
 
 function ProductTab(){
@@ -88,18 +101,22 @@ function ProductTab(){
         </>
     )
 }
+```
 
 Option 2 : 
 
+```javascript
 return(
     <>
     <Product title="phone" price={30000} features={{a:"hi-tech"}}/>
     </>
 )
+```
 
 
 Rendering array(using map)
 
+```javascript
 function ProductTab(){
     let options=["hi-tech","durable","fast"]
 
@@ -121,18 +138,22 @@ function Product({title, price, features}){
         </div>
     )
 }
+```
 
 
 Conditionals
 
 Adding elements on the basis of some conditions 
 
+```javascript
 {price>=1000 ? <p>Discount : 5% </p> : <p>Price : {price}</p>}
+```
 
 Dynamic Component Styling(Styling decided at runtime)
 
 (styles defined inside the function itself)
 
+```javascript
 function Product({title, price, features}){
     let styles = {backgroundColor : "blue"};
     let styles = {backgroundColor : price>3000?"yellow" : "red"};
@@ -142,9 +163,11 @@ function Product({title, price, features}){
         </div>
     )
 }
+```
 
 Practice example 1 : Show a Hello Message to the user in different color 
 
+```javascript
 function Hello({userName, textColor}){
     return(
         <>
@@ -160,6 +183,7 @@ export default App(){
         </>
     )
 }
+```
 
 
 Practice Example 2 : Building Amazon Cards 
@@ -169,6 +193,7 @@ Practice Example 2 : Building Amazon Cards
 
 Handling onClick events 
 
+```javascript
 function printHello(){
     console.log("Hello!")
 }
@@ -178,9 +203,11 @@ export default function Button(){
         <button onClick={printHello}>Click </button>
     )
 }
+```
 
 Handling nonClick events
 
+```javascript
 function handleHover(){
     console.log("Hovered")
 }
@@ -190,9 +217,11 @@ export default function Button(){
         <button onMouseOver={handleHover}>Click </button>
     );
 }
+```
 
 Form submit 
 
+```javascript
 function handleFormSubmit(event){
     event.preventDefault();
     console.log("Form submitted")
@@ -205,6 +234,7 @@ export default function Form(){
         </form>
     );
 }
+```
 
 React has 4 main pillars (State, Components, Hooks, Props)
 
@@ -223,7 +253,9 @@ Hooks can only be called in side function component
 
 1. useState() : react hook that lets us add a state variable to our component (re-render mei help karta hai)
 
+```javascript
 const [state, setState] = useState(initialStatevalue)
+```
 
 useState always returns an array with exactly two values
 
@@ -232,6 +264,7 @@ setState re render ko trigger karata hai
 Practice : Create Like button (Toggle : Like Unlike)
 
 
+```javascript
 import React from "react"
 import { useState } from "react"
 function LikeButton(){
@@ -253,6 +286,7 @@ function LikeButton(){
 }
 
 export default LikeButton
+```
 
 
 **Re-render : How does it work ? **
@@ -262,15 +296,18 @@ setState jabhi call hoga pura function re execute hoga
 setStates are async methods 
 
 eg. 
+```javascript
 let incCount() =>{
     setCount(count+1)
     setCount(count+1)
 }
+```
 
 the value of count should increase by 1, but it does not, because setCount are async functions 
 
 but this would work 
 
+```javascript
 let incCount(){
     setCount((currCount)=>{
         return currCount+1;
@@ -279,6 +316,7 @@ let incCount(){
         return currCount+1;
     })
 }
+```
 
 this would increase the count by 2 
 
@@ -288,11 +326,15 @@ Re-render tabhi hoga jab state variable mei change aayega
 Jab state variable mei change hoga(actual change of variable) tabhi hi change hoga 
 
 example : 
+```javascript
 let [count, setCount] = useState(init())
+```
 abh jabhi bhi re render hoga init call hoga wapas 
 but it wont make a difference to useState kyuki wo bas first time initialisation ke time kaam aata hai 
 
+```javascript
 let [count,setCount] = useState(init)
+```
 this is better kyuki now the function does not get executed on re rendering
 
 
@@ -305,10 +347,13 @@ toh when we use spread operator , it creates a new object and then it gets updat
 eg. 
 
 toh spread aise karte hai 
-***setMoves({...moves, blue : moves.blue+1})***
+```javascript
+setMoves({...moves, blue : moves.blue+1})
+```
             Spread Value     Updated in spread
 
 
+```javascript
 import { useState } from "react"
 
 export default function LudoBoard(){
@@ -342,14 +387,18 @@ export default function LudoBoard(){
         </div>
     )
 }
+```
 
 ### Arrays in States 
 
+```javascript
 setArr([..arr, "new element added in the back"])
+```
 
 Practice : Create a ToDoList 
 
 
+```javascript
 import { useState } from "react";
 export default function ToDoList(){
     let [todos, settodos] = useState(["sample tasks"])
@@ -381,11 +430,13 @@ export default function ToDoList(){
         </div>
     )
 }
+```
 
 ### Unique Key for List items 
 
 It is a better idea to create an array of objects each having a unique id 
 
+```javascript
 let [todos, settodos] = useState([{task:"sample-task", id:uuidv4()}])
     let [newtodo, setnewTodo] = useState("")
     let addNewTask = (e) =>{
@@ -418,11 +469,13 @@ let [todos, settodos] = useState([{task:"sample-task", id:uuidv4()}])
             </form>
         </div>
     )
+```
 
 ### Deleting from Arrays 
 
 filter is used to delete element in React 
 
+```javascript
 import { useState } from "react";
 import {v4 as uuidv4} from 'uuid';
 export default function ToDoList(){
@@ -462,12 +515,14 @@ export default function ToDoList(){
         </div>
     )
 }
+```
 
 
 ### Updating elements in array 
 
 ***Updating all elements in array*** 
 
+```javascript
 let UpperCaseAll = () =>{
     setTasks((prevTasks)=>{
         prevTasks.map((todo)=>{
@@ -478,9 +533,11 @@ let UpperCaseAll = () =>{
         })
     })
 }
+```
 
 ***Updating one element in array***
 
+```javascript
 let updateOneTask = (id) => {
     setTasks((prevTasks)=>{
         prevTasks.map(todo)=>{
@@ -496,9 +553,11 @@ let updateOneTask = (id) => {
         }
     })
 }
+```
 
 Practice : Mark as Done feature in ToDoList 
 
+```javascript
 import { useState } from "react";
 import { v4 as uuidv4 } from 'uuid';
 
@@ -566,10 +625,12 @@ export default function ToDoList() {
         </div>
     );
 }
+```
 
 
 Practice : Lottery Question 
 
+```javascript
 // what do we need 
 // 1. <h1> Lottery <h1> 
 // This changes based on a condition 
@@ -607,23 +668,4 @@ export default function Lottery() {
         </div>
     )
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+```
