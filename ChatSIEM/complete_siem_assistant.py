@@ -1,0 +1,2105 @@
+"""
+complete_siem_assistant.py - Full implementation of the Conversational SIEM Assistant
+This combines all provided modules into a single runnable file for simplicity.
+To run:
+1. Save the docker-compose.yml and start: docker-compose up -d
+2. Save this as complete_siem_assistant.py and config.yaml
+3. Install dependencies: pip install elasticsearch pyyaml python-dateutil pandas
+4. Run: python complete_siem_assistant.py interactive
+
+Note: For demo, you may need to ingest sample logs into Elasticsearch.
+Example: Use curl to index sample security events, or use Filebeat/Logstash.
+Sample ingestion script included at the end.
+"""
+
+# --- Imports ---
+import yaml
+import os
+import sys
+import re
+from typing import Dict, List, Any, Optional
+from datetime import datetime, timedelta
+import logging
+from dotenv import load_dotenv
+import pandas as pd
+import json
+
+from dateutil import parser as date_parser
+
+from elasticsearch import Elasticsearch, exceptions
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# --- Intent Parser Module ---
+class Intent:
+    """Represents a parsed user intent"""
+    
+    def __init__(self, action: str, entities: Dict[str, Any], 
+                 filters: Dict[str, Any], context: Optional[Dict] = None):
+        self.action = action  # search, count, aggregate, report
+        self.entities = entities  # event types, users, IPs, etc.
+        self.filters = filters  # time range, status, etc.
+        self.context = context or {}
+        self.timestamp = datetime.now()
+    
+    def __repr__(self):
+        return f"Intent(action={self.action}, entities={self.entities}, filters={self.filters})"
+
+
+class IntentParser:
+    """Parses natural language into structured intents"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.schema = config.get('schema', {})
+        self.time_ranges = config.get('time_ranges', {})
+        
+        # Intent patterns
+        self.action_patterns = {
+            'search': [
+                r'show|find|get|list|display|what|which',
+                r'search for|look for|give me'
+            ],
+            'count': [
+                r'how many|count|number of|total',
+                r'how much'
+            ],
+            'aggregate': [
+                r'summarize|summary|group by|breakdown',
+                r'aggregate|top|most|least'
+            ],
+            'report': [
+                r'report|generate report|create report',
+                r'export|document'
+            ]
+        }
+        
+        # Entity patterns for security events
+        self.entity_patterns = {
+            'failed_login': [
+                r'failed login|login failure|authentication fail|unsuccessful login',
+                r'failed auth|auth fail|bad password|invalid credentials'
+            ],
+            'successful_login': [
+                r'successful login|login success|authenticated|logged in successfully'
+            ],
+            'malware': [
+                r'malware|virus|trojan|ransomware|suspicious file',
+                r'threat detected|malicious|infected'
+            ],
+            'network_connection': [
+                r'network connection|outbound connection|inbound connection',
+                r'network traffic|connection attempt'
+            ],
+            'vpn': [
+                r'vpn|virtual private network|vpn connection|vpn login',
+                r'remote access'
+            ],
+            'firewall': [
+                r'firewall|blocked|denied|dropped',
+                r'firewall rule|firewall block'
+            ],
+            'user_activity': [
+                r'user activity|user action|user behavior',
+                r'what did user|user events'
+            ],
+            'alerts': [
+                r'alert|security alert|triggered alert|alerted',
+                r'detection|detected'
+            ],
+            'process': [
+                r'process|execution|program|command|executed'
+            ],
+            'file_operation': [
+                r'file created|file modified|file deleted|file access',
+                r'file operation|file activity'
+            ]
+        }
+        
+        # Filter patterns
+        self.filter_patterns = {
+            'user': r'(?:user|username|account|user name)[\s:]+([a-zA-Z0-9._-]+)',
+            'ip': r'\b(?:\d{1,3}\.){3}\d{1,3}\b',
+            'hostname': r'(?:host|hostname|computer)[\s:]+([a-zA-Z0-9._-]+)',
+            'source_ip': r'(?:source|from|src)[\s:]+(?:ip[\s:]+)?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})',
+            'destination_ip': r'(?:destination|dest|dst|to)[\s:]+(?:ip[\s:]+)?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})',
+            'port': r'(?:port|:)(\d{1,5})',
+            'severity': r'(?:severity|priority)[\s:]+(\w+)',
+            'status': r'(?:status)[\s:]+(\w+)'
+        }
+    
+    def parse(self, query: str, context: Optional[Dict] = None) -> Intent:
+        """
+        Parse a natural language query into an Intent
+        
+        Args:
+            query: Natural language query
+            context: Previous conversation context
+            
+        Returns:
+            Parsed Intent object
+        """
+        query_lower = query.lower()
+        
+        # Detect action
+        action = self._detect_action(query_lower)
+        
+        # Extract entities
+        entities = self._extract_entities(query_lower)
+        
+        # Extract filters
+        filters = self._extract_filters(query, query_lower)
+        
+        # Apply context from previous queries
+        if context:
+            entities = self._apply_context(entities, context.get('entities', {}))
+            filters = self._apply_context(filters, context.get('filters', {}))
+        
+        return Intent(action, entities, filters, context)
+    
+    def _detect_action(self, query: str) -> str:
+        """Detect the primary action from query"""
+        for action, patterns in self.action_patterns.items():
+            for pattern in patterns:
+                if re.search(pattern, query, re.IGNORECASE):
+                    return action
+        
+        # Default to search
+        return 'search'
+    
+    def _extract_entities(self, query: str) -> Dict[str, Any]:
+        """Extract security event entities from query"""
+        entities = {'event_types': []}
+        
+        for entity_type, patterns in self.entity_patterns.items():
+            for pattern in patterns:
+                if re.search(pattern, query, re.IGNORECASE):
+                    entities['event_types'].append(entity_type)
+                    
+                    # Add schema information if available
+                    if entity_type in self.schema:
+                        entities[f'{entity_type}_schema'] = self.schema[entity_type]
+        
+        return entities
+    
+    def _extract_filters(self, original_query: str, query: str) -> Dict[str, Any]:
+        """Extract filters from query"""
+        filters = {}
+        
+        # Extract specific filters using patterns
+        for filter_name, pattern in self.filter_patterns.items():
+            match = re.search(pattern, original_query, re.IGNORECASE)
+            if match:
+                filters[filter_name] = match.group(1)
+        
+        # Extract time range
+        time_filter = self._extract_time_range(query)
+        if time_filter:
+            filters['time_range'] = time_filter
+        
+        # Extract limit/size
+        limit_match = re.search(r'(?:top|first|last|limit)\s+(\d+)', query, re.IGNORECASE)
+        if limit_match:
+            filters['limit'] = int(limit_match.group(1))
+        
+        return filters
+    
+    def _extract_time_range(self, query: str) -> Optional[Dict[str, str]]:
+        """Extract time range from query"""
+        # Check predefined time ranges
+        for time_key, time_value in self.time_ranges.items():
+            if time_key.replace('_', ' ') in query:
+                return {
+                    'gte': time_value,
+                    'lte': 'now'
+                }
+        
+        # Try to parse specific dates
+        date_patterns = [
+            r'(?:from|since|after)\s+([0-9]{4}-[0-9]{2}-[0-9]{2})',
+            r'(?:until|before|to)\s+([0-9]{4}-[0-9]{2}-[0-9]{2})',
+            r'on\s+([0-9]{4}-[0-9]{2}-[0-9]{2})'
+        ]
+        
+        for pattern in date_patterns:
+            match = re.search(pattern, query)
+            if match:
+                try:
+                    date_str = match.group(1)
+                    parsed_date = date_parser.parse(date_str)
+                    
+                    if 'from' in pattern or 'since' in pattern or 'after' in pattern:
+                        return {'gte': parsed_date.isoformat(), 'lte': 'now'}
+                    elif 'until' in pattern or 'before' in pattern or 'to' in pattern:
+                        return {'gte': 'now-30d', 'lte': parsed_date.isoformat()}
+                    elif 'on' in pattern:
+                        end_date = parsed_date + timedelta(days=1)
+                        return {
+                            'gte': parsed_date.isoformat(),
+                            'lte': end_date.isoformat()
+                        }
+                except Exception as e:
+                    logger.warning(f"Failed to parse date: {e}")
+        
+        # Default time range for queries without explicit time
+        return {'gte': 'now-24h', 'lte': 'now'}
+    
+    def _apply_context(self, current: Dict[str, Any], 
+                       previous: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply context from previous queries"""
+        # Merge context intelligently
+        result = previous.copy()
+        result.update(current)
+        
+        # Combine event types if present in both
+        if 'event_types' in current and 'event_types' in previous:
+            current_types = set(current['event_types'])
+            previous_types = set(previous['event_types'])
+            
+            # If current is more specific, use it; otherwise combine
+            if current_types:
+                result['event_types'] = list(current_types)
+            else:
+                result['event_types'] = list(previous_types)
+        
+        return result
+    
+    def extract_filter_refinements(self, query: str) -> Dict[str, Any]:
+        """
+        Extract filter refinements for follow-up queries
+        Examples: "only VPN", "exclude user admin", "from last hour"
+        """
+        refinements = {}
+        
+        # Include/only patterns
+        include_match = re.search(r'(?:only|just|include)\s+(.+)', query, re.IGNORECASE)
+        if include_match:
+            refinements['include'] = include_match.group(1).strip()
+        
+        # Exclude patterns
+        exclude_match = re.search(r'(?:exclude|without|not)\s+(.+)', query, re.IGNORECASE)
+        if exclude_match:
+            refinements['exclude'] = exclude_match.group(1).strip()
+        
+        # Time refinements
+        if 'last hour' in query.lower():
+            refinements['time_range'] = {'gte': 'now-1h', 'lte': 'now'}
+        
+        return refinements
+
+
+class ContextManager:
+    """Manages conversation context across multiple queries"""
+    
+    def __init__(self, max_history: int = 10):
+        self.max_history = max_history
+        self.history: List[Intent] = []
+        self.current_context: Dict[str, Any] = {}
+    
+    def add_intent(self, intent: Intent):
+        """Add an intent to history"""
+        self.history.append(intent)
+        
+        # Update current context
+        self.current_context = {
+            'entities': intent.entities,
+            'filters': intent.filters,
+            'action': intent.action
+        }
+        
+        # Trim history if needed
+        if len(self.history) > self.max_history:
+            self.history.pop(0)
+    
+    def get_context(self) -> Dict[str, Any]:
+        """Get current context"""
+        return self.current_context
+    
+    def clear(self):
+        """Clear conversation history"""
+        self.history.clear()
+        self.current_context.clear()
+    
+    def get_last_intent(self) -> Optional[Intent]:
+        """Get the last intent"""
+        return self.history[-1] if self.history else None
+    
+    def is_refinement_query(self, query: str) -> bool:
+        """Check if query is refining previous query"""
+        refinement_keywords = [
+            'filter', 'only', 'exclude', 'also', 'and', 
+            'show more', 'narrow', 'focus on', 'just'
+        ]
+        
+        query_lower = query.lower()
+        return any(keyword in query_lower for keyword in refinement_keywords)
+
+# --- Query Generator Module ---
+class QueryGenerator:
+    """Generates Elasticsearch DSL queries from intents"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.schema = config.get('schema', {})
+        self.indices = config['siem'].get('indices', {})
+        self.limits = config.get('limits', {})
+    
+    def generate(self, intent: Intent) -> Dict[str, Any]:
+        """
+        Generate Elasticsearch query from intent
+        
+        Args:
+            intent: Parsed intent
+            
+        Returns:
+            Dictionary with 'index' and 'query' for Elasticsearch
+        """
+        # Determine which index to query
+        index = self._determine_index(intent)
+        
+        # Build the query based on action
+        if intent.action == 'count':
+            query = self._build_count_query(intent)
+        elif intent.action == 'aggregate':
+            query = self._build_aggregation_query(intent)
+        elif intent.action == 'report':
+            query = self._build_report_query(intent)
+        else:  # search
+            query = self._build_search_query(intent)
+        
+        return {
+            'index': index,
+            'query': query,
+            'size': self._determine_size(intent)
+        }
+    
+    def _determine_index(self, intent: Intent) -> str:
+        """Determine which index pattern to query"""
+        event_types = intent.entities.get('event_types', [])
+        
+        # Map event types to indices
+        if 'malware' in event_types or 'threat' in event_types:
+            return self.indices.get('endpoint_security', 'logs-*')
+        elif 'network_connection' in event_types:
+            return self.indices.get('network_traffic', 'packetbeat-*')
+        elif 'alerts' in event_types:
+            return self.indices.get('alerts', '.alerts-*')
+        else:
+            return self.indices.get('security_events', 'logs-*')
+    
+    def _determine_size(self, intent: Intent) -> int:
+        """Determine result size limit"""
+        if 'limit' in intent.filters:
+            return min(intent.filters['limit'], self.limits.get('max_results', 10000))
+        
+        if intent.action == 'aggregate':
+            return 0  # Don't return documents for aggregations
+        
+        return self.limits.get('default_size', 100)
+    
+    def _build_search_query(self, intent: Intent) -> Dict[str, Any]:
+        """Build a search query"""
+        must_clauses = []
+        filter_clauses = []
+        
+        # Add event type conditions
+        must_clauses.extend(self._build_event_conditions(intent))
+        
+        # Add filters
+        filter_clauses.extend(self._build_filter_conditions(intent))
+        
+        # Add time range
+        if 'time_range' in intent.filters:
+            filter_clauses.append({
+                'range': {
+                    '@timestamp': intent.filters['time_range']
+                }
+            })
+        
+        query = {
+            'query': {
+                'bool': {
+                    'must': must_clauses if must_clauses else [{'match_all': {}}],
+                    'filter': filter_clauses
+                }
+            },
+            'sort': [
+                {'@timestamp': {'order': 'desc'}}
+            ]
+        }
+        
+        return query
+    
+    def _build_count_query(self, intent: Intent) -> Dict[str, Any]:
+        """Build a count query"""
+        # Similar to search but we only need the bool query
+        must_clauses = []
+        filter_clauses = []
+        
+        must_clauses.extend(self._build_event_conditions(intent))
+        filter_clauses.extend(self._build_filter_conditions(intent))
+        
+        if 'time_range' in intent.filters:
+            filter_clauses.append({
+                'range': {
+                    '@timestamp': intent.filters['time_range']
+                }
+            })
+        
+        return {
+            'query': {
+                'bool': {
+                    'must': must_clauses if must_clauses else [{'match_all': {}}],
+                    'filter': filter_clauses
+                }
+            }
+        }
+    
+    def _build_aggregation_query(self, intent: Intent) -> Dict[str, Any]:
+        """Build an aggregation query"""
+        base_query = self._build_count_query(intent)
+        
+        # Determine aggregation fields
+        agg_field = self._determine_aggregation_field(intent)
+        
+        # Add aggregation
+        base_query['aggs'] = {
+            'grouped_results': {
+                'terms': {
+                    'field': agg_field,
+                    'size': self.limits.get('aggregation_size', 50)
+                }
+            },
+            'over_time': {
+                'date_histogram': {
+                    'field': '@timestamp',
+                    'calendar_interval': self._determine_time_interval(intent),
+                    'min_doc_count': 0
+                }
+            }
+        }
+        
+        return base_query
+    
+    def _build_report_query(self, intent: Intent) -> Dict[str, Any]:
+        """Build a comprehensive query for report generation"""
+        base_query = self._build_aggregation_query(intent)
+        
+        # Add multiple aggregations for comprehensive reporting
+        event_types = intent.entities.get('event_types', [])
+        
+        base_query['aggs']['severity_breakdown'] = {
+            'terms': {
+                'field': 'event.severity',
+                'size': 10
+            }
+        }
+        
+        base_query['aggs']['top_users'] = {
+            'terms': {
+                'field': 'user.name.keyword',
+                'size': 10
+            }
+        }
+        
+        base_query['aggs']['top_hosts'] = {
+            'terms': {
+                'field': 'host.name.keyword',
+                'size': 10
+            }
+        }
+        
+        if 'network_connection' in event_types:
+            base_query['aggs']['top_destinations'] = {
+                'terms': {
+                    'field': 'destination.ip',
+                    'size': 10
+                }
+            }
+        
+        return base_query
+    
+    def _build_event_conditions(self, intent: Intent) -> List[Dict[str, Any]]:
+        """Build conditions for event types"""
+        conditions = []
+        event_types = intent.entities.get('event_types', [])
+        
+        for event_type in event_types:
+            if event_type in self.schema:
+                schema = self.schema[event_type]
+                event_conditions = schema.get('conditions', {})
+                
+                for field, values in event_conditions.items():
+                    if isinstance(values, list):
+                        conditions.append({
+                            'terms': {
+                                field: values
+                            }
+                        })
+                    else:
+                        conditions.append({
+                            'term': {
+                                field: values
+                            }
+                        })
+        
+        return conditions
+    
+    def _build_filter_conditions(self, intent: Intent) -> List[Dict[str, Any]]:
+        """Build filter conditions"""
+        conditions = []
+        filters = intent.filters
+        
+        # User filter
+        if 'user' in filters:
+            conditions.append({
+                'term': {
+                    'user.name.keyword': filters['user']
+                }
+            })
+        
+        # IP filters
+        if 'ip' in filters:
+            conditions.append({
+                'bool': {
+                    'should': [
+                        {'term': {'source.ip': filters['ip']}},
+                        {'term': {'destination.ip': filters['ip']}}
+                    ]
+                }
+            })
+        
+        if 'source_ip' in filters:
+            conditions.append({
+                'term': {
+                    'source.ip': filters['source_ip']
+                }
+            })
+        
+        if 'destination_ip' in filters:
+            conditions.append({
+                'term': {
+                    'destination.ip': filters['destination_ip']
+                }
+            })
+        
+        # Hostname filter
+        if 'hostname' in filters:
+            conditions.append({
+                'term': {
+                    'host.name.keyword': filters['hostname']
+                }
+            })
+        
+        # Port filter
+        if 'port' in filters:
+            conditions.append({
+                'term': {
+                    'destination.port': int(filters['port'])
+                }
+            })
+        
+        # Severity filter
+        if 'severity' in filters:
+            conditions.append({
+                'term': {
+                    'event.severity': filters['severity'].lower()
+                }
+            })
+        
+        # Status filter
+        if 'status' in filters:
+            conditions.append({
+                'term': {
+                    'event.outcome': filters['status'].lower()
+                }
+            })
+        
+        return conditions
+    
+    def _determine_aggregation_field(self, intent: Intent) -> str:
+        """Determine the best field for aggregation"""
+        event_types = intent.entities.get('event_types', [])
+        
+        # Check for specific aggregation requests in the query
+        if 'user' in str(intent.entities).lower():
+            return 'user.name.keyword'
+        elif 'host' in str(intent.entities).lower():
+            return 'host.name.keyword'
+        elif 'ip' in str(intent.entities).lower():
+            return 'source.ip'
+        
+        # Default aggregations based on event type
+        if 'malware' in event_types:
+            return 'file.name.keyword'
+        elif 'network_connection' in event_types:
+            return 'destination.ip'
+        elif 'failed_login' in event_types or 'successful_login' in event_types:
+            return 'user.name.keyword'
+        
+        # Default
+        return 'event.action.keyword'
+    
+    def _determine_time_interval(self, intent: Intent) -> str:
+        """Determine appropriate time interval for date histograms"""
+        time_range = intent.filters.get('time_range', {})
+        gte = time_range.get('gte', 'now-24h')
+        
+        # Parse the time range to determine interval
+        if 'now-1h' in gte or 'last_hour' in gte:
+            return '1m'  # 1 minute intervals
+        elif 'now-24h' in gte or 'now-1d' in gte:
+            return '1h'  # 1 hour intervals
+        elif 'now-7d' in gte:
+            return '1d'  # 1 day intervals
+        elif 'now-30d' in gte or 'now-1M' in gte:
+            return '1d'  # 1 day intervals
+        else:
+            return '1d'  # Default to daily
+    
+    def generate_kql(self, intent: Intent) -> str:
+        """
+        Generate KQL (Kibana Query Language) as alternative to DSL
+        
+        Args:
+            intent: Parsed intent
+            
+        Returns:
+            KQL query string
+        """
+        kql_parts = []
+        
+        # Add event type conditions
+        event_types = intent.entities.get('event_types', [])
+        for event_type in event_types:
+            if event_type in self.schema:
+                schema = self.schema[event_type]
+                conditions = schema.get('conditions', {})
+                
+                for field, values in conditions.items():
+                    if isinstance(values, list):
+                        value_str = ' or '.join([f'"{v}"' for v in values])
+                        kql_parts.append(f'{field}: ({value_str})')
+                    else:
+                        kql_parts.append(f'{field}: "{values}"')
+        
+        # Add filters
+        filters = intent.filters
+        
+        if 'user' in filters:
+            kql_parts.append(f'user.name: "{filters["user"]}"')
+        
+        if 'source_ip' in filters:
+            kql_parts.append(f'source.ip: {filters["source_ip"]}')
+        
+        if 'destination_ip' in filters:
+            kql_parts.append(f'destination.ip: {filters["destination_ip"]}')
+        
+        if 'hostname' in filters:
+            kql_parts.append(f'host.name: "{filters["hostname"]}"')
+        
+        if 'port' in filters:
+            kql_parts.append(f'destination.port: {filters["port"]}')
+        
+        # Combine with AND
+        kql = ' and '.join(kql_parts) if kql_parts else '*'
+        
+        return kql
+    
+    def optimize_query(self, query: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Optimize query for performance
+        
+        Args:
+            query: Elasticsearch query
+            
+        Returns:
+            Optimized query
+        """
+        # Add _source filtering to reduce payload
+        if '_source' not in query:
+            query['_source'] = [
+                '@timestamp',
+                'event.*',
+                'user.name',
+                'host.name',
+                'source.ip',
+                'destination.ip',
+                'destination.port',
+                'file.name',
+                'process.name',
+                'message'
+            ]
+        
+        # Add track_total_hits limit for better performance
+        if 'track_total_hits' not in query:
+            query['track_total_hits'] = 10000
+        
+        return query
+
+
+class QueryValidator:
+    """Validates generated queries before execution"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.max_results = config.get('limits', {}).get('max_results', 10000)
+    
+    def validate(self, query_config: Dict[str, Any]) -> tuple[bool, Optional[str]]:
+        """
+        Validate a query configuration
+        
+        Args:
+            query_config: Query configuration with index and query
+            
+        Returns:
+            Tuple of (is_valid, error_message)
+        """
+        # Check if index is specified
+        if 'index' not in query_config:
+            return False, "No index specified"
+        
+        # Check if query is present
+        if 'query' not in query_config:
+            return False, "No query specified"
+        
+        # Validate size
+        size = query_config.get('size', 0)
+        if size > self.max_results:
+            return False, f"Size {size} exceeds maximum {self.max_results}"
+        
+        # Validate query structure
+        query = query_config['query']
+        if not isinstance(query, dict):
+            return False, "Query must be a dictionary"
+        
+        if 'query' not in query:
+            return False, "Query must contain 'query' field"
+        
+        return True, None
+    
+    def estimate_cost(self, query_config: Dict[str, Any]) -> str:
+        """
+        Estimate the performance cost of a query
+        
+        Args:
+            query_config: Query configuration
+            
+        Returns:
+            Cost estimate: 'low', 'medium', 'high'
+        """
+        query = query_config.get('query', {})
+        size = query_config.get('size', 100)
+        
+        # Check for expensive operations
+        has_aggregations = 'aggs' in query
+        has_wildcards = self._has_wildcards(query)
+        has_regex = self._has_regex(query)
+        
+        if has_regex or (has_aggregations and size > 1000):
+            return 'high'
+        elif has_wildcards or has_aggregations:
+            return 'medium'
+        else:
+            return 'low'
+    
+    def _has_wildcards(self, obj: Any) -> bool:
+        """Check if query contains wildcard queries"""
+        if isinstance(obj, dict):
+            if 'wildcard' in obj:
+                return True
+            return any(self._has_wildcards(v) for v in obj.values())
+        elif isinstance(obj, list):
+            return any(self._has_wildcards(item) for item in obj)
+        return False
+    
+    def _has_regex(self, obj: Any) -> bool:
+        """Check if query contains regex queries"""
+        if isinstance(obj, dict):
+            if 'regexp' in obj:
+                return True
+            return any(self._has_regex(v) for v in obj.values())
+        elif isinstance(obj, list):
+            return any(self._has_regex(item) for item in obj)
+        return False
+
+# --- Response Formatter Module ---
+class ResponseFormatter:
+    """Formats raw SIEM results into user-friendly output"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+    
+    def format_response(self, results: Dict[str, Any], 
+                       intent_action: str) -> Dict[str, Any]:
+        """
+        Format response based on intent action
+        
+        Args:
+            results: Raw Elasticsearch results
+            intent_action: Type of action (search, count, aggregate, report)
+            
+        Returns:
+            Formatted response with text, data, and visualizations
+        """
+        if intent_action == 'count':
+            return self._format_count_response(results)
+        elif intent_action == 'aggregate':
+            return self._format_aggregation_response(results)
+        elif intent_action == 'report':
+            return self._format_report_response(results)
+        else:  # search
+            return self._format_search_response(results)
+    
+    def _format_search_response(self, results: Dict[str, Any]) -> Dict[str, Any]:
+        """Format search results"""
+        hits = results.get('hits', {}).get('hits', [])
+        total = results.get('hits', {}).get('total', {}).get('value', 0)
+        
+        # Extract relevant fields
+        formatted_hits = []
+        for hit in hits:
+            source = hit['_source']
+            formatted_hit = {
+                'timestamp': source.get('@timestamp', 'N/A'),
+                'event_type': source.get('event', {}).get('action', 'N/A'),
+                'user': source.get('user', {}).get('name', 'N/A'),
+                'host': source.get('host', {}).get('name', 'N/A'),
+                'source_ip': source.get('source', {}).get('ip', 'N/A'),
+                'destination_ip': source.get('destination', {}).get('ip', 'N/A'),
+                'outcome': source.get('event', {}).get('outcome', 'N/A'),
+                'message': source.get('message', 'N/A')
+            }
+            formatted_hits.append(formatted_hit)
+        
+        # Generate text summary
+        text_summary = self._generate_search_summary(formatted_hits, total)
+        
+        # Create table data
+        table_data = self._create_table(formatted_hits)
+        
+        return {
+            'type': 'search',
+            'text': text_summary,
+            'total_count': total,
+            'result_count': len(hits),
+            'data': formatted_hits,
+            'table': table_data
+        }
+    
+    def _format_count_response(self, results: Dict[str, Any]) -> Dict[str, Any]:
+        """Format count results"""
+        count = results.get('hits', {}).get('total', {}).get('value', 0)
+        
+        text_summary = f"Found {count} matching events."
+        
+        return {
+            'type': 'count',
+            'text': text_summary,
+            'count': count
+        }
+    
+    def _format_aggregation_response(self, results: Dict[str, Any]) -> Dict[str, Any]:
+        """Format aggregation results"""
+        aggregations = results.get('aggregations', {})
+        
+        # Extract grouped results
+        grouped = aggregations.get('grouped_results', {}).get('buckets', [])
+        over_time = aggregations.get('over_time', {}).get('buckets', [])
+        
+        # Format grouped data
+        grouped_data = [
+            {
+                'key': bucket['key'],
+                'count': bucket['doc_count']
+            }
+            for bucket in grouped[:10]  # Top 10
+        ]
+        
+        # Format time series data
+        time_series = [
+            {
+                'timestamp': bucket['key_as_string'],
+                'count': bucket['doc_count']
+            }
+            for bucket in over_time
+        ]
+        
+        # Generate text summary
+        total_events = sum(item['count'] for item in grouped_data)
+        text_summary = self._generate_aggregation_summary(grouped_data, total_events)
+        
+        # Create chart data
+        chart_data = self._create_chart_data(grouped_data, time_series)
+        
+        return {
+            'type': 'aggregation',
+            'text': text_summary,
+            'total_count': total_events,
+            'grouped_data': grouped_data,
+            'time_series': time_series,
+            'charts': chart_data
+        }
+    
+    def _format_report_response(self, results: Dict[str, Any]) -> Dict[str, Any]:
+        """Format comprehensive report"""
+        aggregations = results.get('aggregations', {})
+        
+        # Extract all aggregations
+        grouped = aggregations.get('grouped_results', {}).get('buckets', [])
+        over_time = aggregations.get('over_time', {}).get('buckets', [])
+        severity = aggregations.get('severity_breakdown', {}).get('buckets', [])
+        top_users = aggregations.get('top_users', {}).get('buckets', [])
+        top_hosts = aggregations.get('top_hosts', {}).get('buckets', [])
+        
+        # Format data
+        report_data = {
+            'overview': {
+                'total_events': sum(b['doc_count'] for b in grouped),
+                'time_range': self._extract_time_range(over_time),
+                'generated_at': datetime.now().isoformat()
+            },
+            'event_breakdown': [
+                {'type': b['key'], 'count': b['doc_count']}
+                for b in grouped
+            ],
+            'severity_breakdown': [
+                {'severity': b['key'], 'count': b['doc_count']}
+                for b in severity
+            ],
+            'top_users': [
+                {'user': b['key'], 'events': b['doc_count']}
+                for b in top_users
+            ],
+            'top_hosts': [
+                {'host': b['key'], 'events': b['doc_count']}
+                for b in top_hosts
+            ],
+            'timeline': [
+                {'timestamp': b['key_as_string'], 'count': b['doc_count']}
+                for b in over_time
+            ]
+        }
+        
+        # Generate narrative text
+        narrative = self._generate_report_narrative(report_data)
+        
+        # Create visualizations
+        charts = self._create_report_charts(report_data)
+        
+        return {
+            'type': 'report',
+            'text': narrative,
+            'data': report_data,
+            'charts': charts,
+            'metadata': {
+                'generated_at': report_data['overview']['generated_at'],
+                'total_events': report_data['overview']['total_events']
+            }
+        }
+    
+    def _generate_search_summary(self, hits: List[Dict], total: int) -> str:
+        """Generate natural language summary of search results"""
+        if total == 0:
+            return "No matching events found."
+        
+        summary_parts = [f"Found {total} events."]
+        
+        if hits:
+            # Extract key statistics
+            users = set(h['user'] for h in hits if h['user'] != 'N/A')
+            hosts = set(h['host'] for h in hits if h['host'] != 'N/A')
+            
+            if users:
+                summary_parts.append(f"Involving {len(users)} unique user(s).")
+            if hosts:
+                summary_parts.append(f"Across {len(hosts)} host(s).")
+            
+            # Add time information
+            if hits[0]['timestamp'] != 'N/A':
+                summary_parts.append(f"Latest event at {hits[0]['timestamp']}.")
+        
+        return " ".join(summary_parts)
+    
+    def _generate_aggregation_summary(self, grouped_data: List[Dict], 
+                                     total: int) -> str:
+        """Generate summary for aggregation results"""
+        if not grouped_data:
+            return "No data available for aggregation."
+        
+        top_item = grouped_data[0]
+        summary = f"Total of {total} events across {len(grouped_data)} categories. "
+        summary += f"Top category: '{top_item['key']}' with {top_item['count']} events "
+        summary += f"({(top_item['count']/total*100):.1f}% of total)."
+        
+        return summary
+    
+    def _generate_report_narrative(self, report_data: Dict[str, Any]) -> str:
+        """Generate narrative text for report"""
+        overview = report_data['overview']
+        
+        narrative = f"""
+# Security Event Report
+
+**Generated:** {overview['generated_at']}
+**Time Range:** {overview['time_range']}
+**Total Events:** {overview['total_events']:,}
+
+## Executive Summary
+
+This report provides a comprehensive analysis of security events during the specified time period. 
+A total of {overview['total_events']:,} events were analyzed.
+
+## Event Breakdown
+
+"""
+        
+        # Add event breakdown
+        for event in report_data['event_breakdown'][:5]:
+            percentage = (event['count'] / overview['total_events'] * 100)
+            narrative += f"- **{event['type']}**: {event['count']:,} events ({percentage:.1f}%)\n"
+        
+        # Add severity analysis
+        if report_data['severity_breakdown']:
+            narrative += "\n## Severity Analysis\n\n"
+            for sev in report_data['severity_breakdown']:
+                narrative += f"- {sev['severity'].upper()}: {sev['count']:,} events\n"
+        
+        # Add top users
+        if report_data['top_users']:
+            narrative += "\n## Most Active Users\n\n"
+            for user in report_data['top_users'][:5]:
+                narrative += f"- {user['user']}: {user['events']:,} events\n"
+        
+        # Add top hosts
+        if report_data['top_hosts']:
+            narrative += "\n## Most Active Hosts\n\n"
+            for host in report_data['top_hosts'][:5]:
+                narrative += f"- {host['host']}: {host['events']:,} events\n"
+        
+        return narrative
+    
+    def _create_table(self, data: List[Dict]) -> str:
+        """Create ASCII table from data"""
+        if not data:
+            return "No data to display"
+        
+        # Use pandas for nice table formatting
+        df = pd.DataFrame(data)
+        return df.to_string(index=False, max_rows=20)
+    
+    def _create_chart_data(self, grouped: List[Dict], 
+                          time_series: List[Dict]) -> Dict[str, Any]:
+        """Create chart specifications for visualization"""
+        charts = {}
+        
+        # Bar chart for grouped data
+        if grouped:
+            charts['bar_chart'] = {
+                'type': 'bar',
+                'title': 'Event Distribution',
+                'data': {
+                    'labels': [item['key'] for item in grouped],
+                    'values': [item['count'] for item in grouped]
+                }
+            }
+        
+        # Time series chart
+        if time_series:
+            charts['timeline'] = {
+                'type': 'line',
+                'title': 'Events Over Time',
+                'data': {
+                    'timestamps': [item['timestamp'] for item in time_series],
+                    'values': [item['count'] for item in time_series]
+                }
+            }
+        
+        return charts
+    
+    def _create_report_charts(self, report_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Create comprehensive charts for report"""
+        charts = {}
+        
+        # Event breakdown pie chart
+        if report_data['event_breakdown']:
+            charts['event_pie'] = {
+                'type': 'pie',
+                'title': 'Event Type Distribution',
+                'data': {
+                    'labels': [e['type'] for e in report_data['event_breakdown']],
+                    'values': [e['count'] for e in report_data['event_breakdown']]
+                }
+            }
+        
+        # Severity bar chart
+        if report_data['severity_breakdown']:
+            charts['severity_bar'] = {
+                'type': 'bar',
+                'title': 'Events by Severity',
+                'data': {
+                    'labels': [s['severity'] for s in report_data['severity_breakdown']],
+                    'values': [s['count'] for s in report_data['severity_breakdown']]
+                }
+            }
+        
+        # Timeline
+        if report_data['timeline']:
+            charts['timeline'] = {
+                'type': 'line',
+                'title': 'Event Timeline',
+                'data': {
+                    'timestamps': [t['timestamp'] for t in report_data['timeline']],
+                    'values': [t['count'] for t in report_data['timeline']]
+                }
+            }
+        
+        # Top users horizontal bar
+        if report_data['top_users']:
+            charts['users_bar'] = {
+                'type': 'horizontal_bar',
+                'title': 'Top 10 Active Users',
+                'data': {
+                    'labels': [u['user'] for u in report_data['top_users'][:10]],
+                    'values': [u['events'] for u in report_data['top_users'][:10]]
+                }
+            }
+        
+        return charts
+    
+    def _extract_time_range(self, time_buckets: List[Dict]) -> str:
+        """Extract human-readable time range from buckets"""
+        if not time_buckets:
+            return "N/A"
+        
+        start = time_buckets[0].get('key_as_string', 'N/A')
+        end = time_buckets[-1].get('key_as_string', 'N/A')
+        
+        return f"{start} to {end}"
+    
+    def export_to_json(self, formatted_response: Dict[str, Any]) -> str:
+        """Export response as JSON"""
+        return json.dumps(formatted_response, indent=2, default=str)
+    
+    def export_to_csv(self, formatted_response: Dict[str, Any]) -> str:
+        """Export response data as CSV"""
+        data = formatted_response.get('data', [])
+        
+        if isinstance(data, list) and data:
+            df = pd.DataFrame(data)
+            return df.to_csv(index=False)
+        
+        return ""
+    
+    def export_to_html(self, formatted_response: Dict[str, Any]) -> str:
+        """Export response as HTML report"""
+        text = formatted_response.get('text', '')
+        data = formatted_response.get('data', [])
+        
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>SIEM Report</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 20px; }}
+                table {{ border-collapse: collapse; width: 100%; }}
+                th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+                th {{ background-color: #4CAF50; color: white; }}
+                .summary {{ background-color: #f9f9f9; padding: 15px; margin: 20px 0; }}
+            </style>
+        </head>
+        <body>
+            <h1>SIEM Investigation Report</h1>
+            <div class="summary">
+                <h2>Summary</h2>
+                <pre>{text}</pre>
+            </div>
+        """
+        
+        if isinstance(data, list) and data:
+            df = pd.DataFrame(data)
+            html += "<h2>Details</h2>"
+            html += df.to_html(index=False)
+        
+        html += """
+        </body>
+        </html>
+        """
+        
+        return html
+
+# --- SIEM Connector Module ---
+class SIEMConnector:
+    """Base connector for ELK-based SIEMs"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        """Initialize SIEM connection"""
+        self.config = config
+        self.client = self._create_client()
+        self._verify_connection()
+    
+    def _create_client(self) -> Elasticsearch:
+        """Create Elasticsearch client with ES 8.x compatibility headers"""
+        siem_config = self.config['siem']
+    
+        client = Elasticsearch(
+            hosts=[{
+                'host': siem_config['host'],
+                'port': siem_config['port'],
+                'scheme': siem_config['scheme']
+            }],
+            basic_auth=(siem_config['username'], siem_config['password']) if siem_config['username'] else None,
+            verify_certs=siem_config.get('verify_certs', False),
+            request_timeout=30,
+            headers={
+                'Accept': 'application/vnd.elasticsearch+json; compatible-with=8',
+                'Content-Type': 'application/vnd.elasticsearch+json; compatible-with=8'
+            }  # Force ES 8.x protocol compatibility
+        )
+        
+        return client
+    
+    def _verify_connection(self):
+        """Verify SIEM connection is working"""
+        try:
+            info = self.client.info()
+            logger.info(f"Connected to Elasticsearch cluster: {info['cluster_name']}")
+            logger.info(f"Version: {info['version']['number']}")
+        except Exception as e:
+            logger.error(f"Failed to connect to SIEM: {e}")
+            raise ConnectionError(f"Cannot connect to SIEM: {e}")
+    
+    def execute_query(self, index: str, query: Dict[str, Any], 
+                     size: int = 100) -> Dict[str, Any]:
+        """
+        Execute an Elasticsearch DSL query
+        
+        Args:
+            index: Index pattern to search
+            query: Elasticsearch DSL query
+            size: Number of results to return
+            
+        Returns:
+            Query results
+        """
+        try:
+            # Optimize query before execution
+            optimized_query = QueryGenerator(self.config).optimize_query(query)
+            
+            response = self.client.search(
+                index=index,
+                body=optimized_query,
+                size=size
+            )
+            
+            logger.info(f"Query executed successfully. Found {response['hits']['total']['value']} hits")
+            return response
+            
+        except exceptions.RequestError as e:
+            logger.error(f"Query error: {e.info}")
+            raise ValueError(f"Invalid query: {e.info['error']['reason']}")
+        except Exception as e:
+            logger.error(f"Unexpected error executing query: {e}")
+            raise
+    
+    def execute_aggregation(self, index: str, query: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Execute an aggregation query
+        
+        Args:
+            index: Index pattern to search
+            query: Query with aggregations
+            
+        Returns:
+            Aggregation results
+        """
+        try:
+            # Optimize query
+            optimized_query = QueryGenerator(self.config).optimize_query(query)
+            
+            response = self.client.search(
+                index=index,
+                body=optimized_query,
+                size=0  # We only want aggregations
+            )
+            
+            return response
+            
+        except Exception as e:
+            logger.error(f"Aggregation error: {e}")
+            raise
+    
+    def count_documents(self, index: str, query: Dict[str, Any]) -> int:
+        """
+        Count documents matching a query
+        
+        Args:
+            index: Index pattern
+            query: Query to count
+            
+        Returns:
+            Document count
+        """
+        try:
+            response = self.client.count(index=index, body=query)
+            return response['count']
+        except Exception as e:
+            logger.error(f"Error counting documents: {e}")
+            return 0
+    
+    def get_index_mappings(self, index: str) -> Dict[str, Any]:
+        """
+        Get field mappings for an index
+        
+        Args:
+            index: Index pattern
+            
+        Returns:
+            Field mappings
+        """
+        try:
+            mappings = self.client.indices.get_mapping(index=index)
+            return mappings
+        except Exception as e:
+            logger.error(f"Error getting mappings: {e}")
+            return {}
+    
+    def search_fields(self, index: str, field_name: str) -> List[str]:
+        """
+        Search for fields matching a pattern
+        
+        Args:
+            index: Index pattern
+            field_name: Field name pattern to search
+            
+        Returns:
+            List of matching field names
+        """
+        try:
+            mappings = self.get_index_mappings(index)
+            fields = []
+            
+            for idx, mapping in mappings.items():
+                properties = mapping['mappings'].get('properties', {})
+                fields.extend(self._extract_fields(properties, field_name))
+            
+            return list(set(fields))
+        except Exception as e:
+            logger.error(f"Error searching fields: {e}")
+            return []
+    
+    def _extract_fields(self, properties: Dict, pattern: str, prefix: str = "") -> List[str]:
+        """Recursively extract field names matching pattern"""
+        fields = []
+        
+        for field, details in properties.items():
+            full_field = f"{prefix}.{field}" if prefix else field
+            
+            if pattern.lower() in field.lower():
+                fields.append(full_field)
+            
+            if 'properties' in details:
+                fields.extend(
+                    self._extract_fields(details['properties'], pattern, full_field)
+                )
+        
+        return fields
+    
+    def get_field_values(self, index: str, field: str, 
+                        query: Optional[Dict] = None, size: int = 100) -> List[Any]:
+        """
+        Get unique values for a field
+        
+        Args:
+            index: Index pattern
+            field: Field name
+            query: Optional filter query
+            size: Max number of unique values
+            
+        Returns:
+            List of unique field values
+        """
+        agg_query = {
+            "size": 0,
+            "aggs": {
+                "unique_values": {
+                    "terms": {
+                        "field": field,
+                        "size": size
+                    }
+                }
+            }
+        }
+        
+        if query:
+            agg_query["query"] = query
+        
+        try:
+            result = self.execute_aggregation(index, agg_query)
+            buckets = result.get('unique_values', {}).get('buckets', [])
+            return [bucket['key'] for bucket in buckets]
+        except Exception as e:
+            logger.error(f"Error getting field values: {e}")
+            return []
+    
+    def close(self):
+        """Close the connection"""
+        if self.client:
+            self.client.close()
+            logger.info("SIEM connection closed")
+
+
+class WazuhConnector(SIEMConnector):
+    """Specialized connector for Wazuh SIEM"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        """Initialize Wazuh connection"""
+        super().__init__(config)
+        # Add Wazuh-specific initialization if needed
+        self.wazuh_api_url = config['siem'].get('wazuh_api_url')
+    
+    def get_agents(self) -> List[Dict[str, Any]]:
+        """Get list of Wazuh agents"""
+        # Implement Wazuh-specific API calls if needed
+        # For now, placeholder
+        logger.warning("Wazuh get_agents not implemented")
+        return []
+    
+    def get_rules(self) -> List[Dict[str, Any]]:
+        """Get Wazuh rules"""
+        # Implement Wazuh-specific API calls if needed
+        logger.warning("Wazuh get_rules not implemented")
+        return []
+
+
+def create_siem_connector(config: Dict[str, Any]) -> SIEMConnector:
+    """
+    Factory function to create appropriate SIEM connector
+    
+    Args:
+        config: Configuration dictionary
+        
+    Returns:
+        Appropriate SIEM connector instance
+    """
+    siem_type = config['siem'].get('type', 'elastic').lower()
+    
+    if siem_type == 'wazuh':
+        return WazuhConnector(config)
+    else:
+        return SIEMConnector(config)
+
+# --- SIEM Assistant Module ---
+class SIEMAssistant:
+    """
+    Conversational SIEM Assistant for Investigation and Automated Threat Reporting
+    """
+    
+    def __init__(self, config_path: str = 'config.yaml'):
+        """
+        Initialize the SIEM Assistant
+        
+        Args:
+            config_path: Path to configuration file
+        """
+        # Load environment variables
+        load_dotenv()
+        
+        # Load configuration
+        self.config = self._load_config(config_path)
+        
+        # Initialize components
+        logger.info("Initializing SIEM Assistant components...")
+        
+        try:
+            self.siem_connector = create_siem_connector(self.config)
+            self.intent_parser = IntentParser(self.config)
+            self.context_manager = ContextManager()
+            self.query_generator = QueryGenerator(self.config)
+            self.query_validator = QueryValidator(self.config)
+            self.response_formatter = ResponseFormatter(self.config)
+            
+            logger.info("SIEM Assistant initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize SIEM Assistant: {e}")
+            raise
+    
+    def _load_config(self, config_path: str) -> Dict[str, Any]:
+        """Load configuration from YAML file"""
+        try:
+            with open(config_path, 'r') as f:
+                config = yaml.safe_load(f)
+            
+            # Substitute environment variables
+            config = self._substitute_env_vars(config)
+            
+            return config
+        except FileNotFoundError:
+            logger.error(f"Configuration file not found: {config_path}")
+            # Provide a minimal default config for demo
+            logger.warning("Using default config")
+            return {
+                'siem': {
+                    'type': 'elastic',
+                    'host': 'localhost',
+                    'port': 9200,
+                    'scheme': 'http',
+                    'username': '',
+                    'password': '',
+                    'verify_certs': False,
+                    'indices': {
+                        'security_events': 'logs-*'
+                    }
+                },
+                'schema': {},
+                'time_ranges': {
+                    'yesterday': 'now-1d/d',
+                    'last week': 'now-7d/d'
+                },
+                'limits': {
+                    'default_size': 100,
+                    'max_results': 1000,
+                    'aggregation_size': 10
+                }
+            }
+        except yaml.YAMLError as e:
+            logger.error(f"Error parsing configuration file: {e}")
+            raise
+    
+    def _substitute_env_vars(self, config: Any) -> Any:
+        """Recursively substitute environment variables in config"""
+        if isinstance(config, dict):
+            return {k: self._substitute_env_vars(v) for k, v in config.items()}
+        elif isinstance(config, list):
+            return [self._substitute_env_vars(item) for item in config]
+        elif isinstance(config, str) and config.startswith('${') and config.endswith('}'):
+            var_name = config[2:-1]
+            return os.getenv(var_name, config)
+        return config
+    
+    def ask(self, query: str) -> Dict[str, Any]:
+        """
+        Process a natural language query
+        
+        Args:
+            query: Natural language query from user
+            
+        Returns:
+            Formatted response with results
+        """
+        try:
+            logger.info(f"Processing query: {query}")
+            
+            # Step 1: Parse intent from natural language
+            context = self.context_manager.get_context()
+            intent = self.intent_parser.parse(query, context)
+            logger.info(f"Parsed intent: {intent}")
+            
+            # Step 2: Generate Elasticsearch query
+            query_config = self.query_generator.generate(intent)
+            logger.info(f"Generated query for index: {query_config['index']}")
+            
+            # Step 3: Validate query
+            is_valid, error_msg = self.query_validator.validate(query_config)
+            if not is_valid:
+                logger.error(f"Query validation failed: {error_msg}")
+                return {
+                    'success': False,
+                    'error': f"Query validation failed: {error_msg}",
+                    'suggestions': self._get_query_suggestions(intent)
+                }
+            
+            # Step 4: Estimate query cost
+            cost = self.query_validator.estimate_cost(query_config)
+            logger.info(f"Query cost estimate: {cost}")
+            
+            # Step 5: Execute query
+            results = self._execute_query(query_config, intent)
+            
+            # Step 6: Format response
+            formatted_response = self.response_formatter.format_response(
+                results, 
+                intent.action
+            )
+            
+            # Step 7: Update context
+            self.context_manager.add_intent(intent)
+            
+            # Add metadata
+            formatted_response['success'] = True
+            formatted_response['query_cost'] = cost
+            formatted_response['intent'] = {
+                'action': intent.action,
+                'entities': intent.entities,
+                'filters': intent.filters
+            }
+            
+            logger.info("Query processed successfully")
+            return formatted_response
+            
+        except Exception as e:
+            logger.error(f"Error processing query: {e}", exc_info=True)
+            return {
+                'success': False,
+                'error': str(e),
+                'suggestions': ['Try rephrasing your question', 
+                              'Check if the time range is valid',
+                              'Verify field names and values']
+            }
+    
+    def _execute_query(self, query_config: Dict[str, Any], 
+                       intent: Intent) -> Dict[str, Any]:
+        """Execute the query based on intent action"""
+        index = query_config['index']
+        query = query_config['query']
+        size = query_config['size']
+        
+        if intent.action == 'count':
+            count = self.siem_connector.count_documents(index, query)
+            return {
+                'hits': {
+                    'total': {'value': count}
+                }
+            }
+        elif intent.action in ['aggregate', 'report']:
+            return self.siem_connector.execute_aggregation(index, query)
+        else:
+            return self.siem_connector.execute_query(index, query, size)
+    
+    def _get_query_suggestions(self, intent: Intent) -> List[str]:
+        """Generate helpful suggestions based on intent"""
+        suggestions = []
+        
+        if not intent.entities.get('event_types'):
+            suggestions.append("Try specifying an event type (e.g., 'failed logins', 'malware', 'network connections')")
+        
+        if not intent.filters.get('time_range'):
+            suggestions.append("Consider adding a time range (e.g., 'yesterday', 'last week', 'last 24 hours')")
+        
+        suggestions.append("Use more specific terms like user names, IP addresses, or hostnames")
+        
+        return suggestions
+    
+    def generate_report(self, query: str, output_format: str = 'text') -> str:
+        """
+        Generate a comprehensive report
+        
+        Args:
+            query: Natural language query describing the report
+            output_format: Output format (text, json, html, csv)
+            
+        Returns:
+            Report in specified format
+        """
+        # Process query with report action
+        response = self.ask(query)
+        
+        if not response.get('success'):
+            return f"Error generating report: {response.get('error')}"
+        
+        # Export based on format
+        if output_format == 'json':
+            return self.response_formatter.export_to_json(response)
+        elif output_format == 'csv':
+            return self.response_formatter.export_to_csv(response)
+        elif output_format == 'html':
+            return self.response_formatter.export_to_html(response)
+        else:
+            return response.get('text', 'No report generated')
+    
+    def get_available_indices(self) -> List[str]:
+        """Get list of available indices in SIEM"""
+        try:
+            indices = self.config['siem']['indices']
+            return list(indices.values())
+        except Exception as e:
+            logger.error(f"Error getting indices: {e}")
+            return []
+    
+    def get_field_suggestions(self, index: str, field_pattern: str) -> List[str]:
+        """
+        Get field name suggestions
+        
+        Args:
+            index: Index pattern to search
+            field_pattern: Partial field name
+            
+        Returns:
+            List of matching field names
+        """
+        return self.siem_connector.search_fields(index, field_pattern)
+    
+    def explain_query(self, query: str) -> Dict[str, Any]:
+        """
+        Explain how a natural language query will be processed
+        
+        Args:
+            query: Natural language query
+            
+        Returns:
+            Explanation of query processing
+        """
+        try:
+            # Parse intent
+            context = self.context_manager.get_context()
+            intent = self.intent_parser.parse(query, context)
+            
+            # Generate query
+            query_config = self.query_generator.generate(intent)
+            
+            # Generate KQL alternative
+            kql = self.query_generator.generate_kql(intent)
+            
+            return {
+                'original_query': query,
+                'detected_intent': {
+                    'action': intent.action,
+                    'event_types': intent.entities.get('event_types', []),
+                    'filters': intent.filters
+                },
+                'target_index': query_config['index'],
+                'elasticsearch_dsl': query_config['query'],
+                'kql_equivalent': kql,
+                'estimated_cost': self.query_validator.estimate_cost(query_config)
+            }
+        except Exception as e:
+            return {
+                'error': str(e),
+                'original_query': query
+            }
+    
+    def clear_context(self):
+        """Clear conversation context"""
+        self.context_manager.clear()
+        logger.info("Conversation context cleared")
+    
+    def get_conversation_history(self) -> List[Dict[str, Any]]:
+        """Get conversation history"""
+        history = []
+        for intent in self.context_manager.history:
+            history.append({
+                'timestamp': intent.timestamp.isoformat(),
+                'action': intent.action,
+                'entities': intent.entities,
+                'filters': intent.filters
+            })
+        return history
+    
+    def health_check(self) -> Dict[str, Any]:
+        """
+        Check health of all components
+        
+        Returns:
+            Health status of components
+        """
+        health = {
+            'overall': 'healthy',
+            'components': {}
+        }
+        
+        # Check SIEM connection
+        try:
+            self.siem_connector.client.info()
+            health['components']['siem_connection'] = 'healthy'
+        except Exception as e:
+            health['components']['siem_connection'] = f'unhealthy: {str(e)}'
+            health['overall'] = 'degraded'
+        
+        # Check configuration
+        try:
+            assert self.config is not None
+            health['components']['configuration'] = 'healthy'
+        except Exception as e:
+            health['components']['configuration'] = f'unhealthy: {str(e)}'
+            health['overall'] = 'degraded'
+        
+        return health
+    
+    def close(self):
+        """Clean up resources"""
+        if hasattr(self, 'siem_connector'):
+            self.siem_connector.close()
+        logger.info("SIEM Assistant closed")
+    
+    def __enter__(self):
+        """Context manager entry"""
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit"""
+        self.close()
+
+
+class InteractiveSession:
+    """Interactive command-line session with the SIEM Assistant"""
+    
+    def __init__(self, config_path: str = 'config.yaml'):
+        """Initialize interactive session"""
+        self.assistant = SIEMAssistant(config_path)
+        self.running = False
+    
+    def start(self):
+        """Start interactive session"""
+        self.running = True
+        
+        print("=" * 70)
+        print("SIEM Conversational Assistant")
+        print("=" * 70)
+        print("\nWelcome! Ask me questions about your security events.")
+        print("\nCommands:")
+        print("  - Type your question naturally")
+        print("  - 'explain <query>' - Explain how a query will be processed")
+        print("  - 'report <query>' - Generate a comprehensive report")
+        print("  - 'clear' - Clear conversation context")
+        print("  - 'history' - Show conversation history")
+        print("  - 'health' - Check system health")
+        print("  - 'help' - Show this help message")
+        print("  - 'exit' or 'quit' - Exit the assistant")
+        print("\n" + "=" * 70 + "\n")
+        
+        while self.running:
+            try:
+                user_input = input("You: ").strip()
+                
+                if not user_input:
+                    continue
+                
+                # Handle commands
+                if user_input.lower() in ['exit', 'quit', 'q']:
+                    self.running = False
+                    print("\nGoodbye!")
+                    break
+                
+                elif user_input.lower() == 'help':
+                    self._show_help()
+                
+                elif user_input.lower() == 'clear':
+                    self.assistant.clear_context()
+                    print("✓ Context cleared")
+                
+                elif user_input.lower() == 'history':
+                    self._show_history()
+                
+                elif user_input.lower() == 'health':
+                    self._show_health()
+                
+                elif user_input.lower().startswith('explain '):
+                    query = user_input[8:].strip()
+                    self._explain_query(query)
+                
+                elif user_input.lower().startswith('report '):
+                    query = user_input[7:].strip()
+                    self._generate_report(query)
+                
+                else:
+                    # Process as normal query
+                    self._process_query(user_input)
+                
+                print()  # Add blank line for readability
+                
+            except KeyboardInterrupt:
+                print("\n\nInterrupted. Type 'exit' to quit.")
+            except Exception as e:
+                print(f"\n✗ Error: {e}")
+                logger.error(f"Session error: {e}", exc_info=True)
+    
+    def _process_query(self, query: str):
+        """Process a user query"""
+        print("\nProcessing...", end='', flush=True)
+        
+        response = self.assistant.ask(query)
+        
+        print("\r" + " " * 20 + "\r", end='')  # Clear "Processing..."
+        
+        if response.get('success'):
+            print(f"Assistant: {response.get('text')}")
+            
+            # Show table if available
+            if 'table' in response:
+                print("\n" + response['table'])
+            
+            # Show count if available
+            if 'count' in response:
+                print(f"\nTotal Count: {response['count']}")
+            
+            # Show cost estimate
+            if 'query_cost' in response:
+                print(f"\nQuery Cost: {response['query_cost']}")
+        else:
+            print(f"✗ Error: {response.get('error')}")
+            if 'suggestions' in response:
+                print("\nSuggestions:")
+                for suggestion in response['suggestions']:
+                    print(f"  • {suggestion}")
+    
+    def _explain_query(self, query: str):
+        """Explain a query"""
+        explanation = self.assistant.explain_query(query)
+        
+        if 'error' in explanation:
+            print(f"✗ Error: {explanation['error']}")
+            return
+        
+        print(f"\nQuery Explanation:")
+        print(f"  Action: {explanation['detected_intent']['action']}")
+        print(f"  Event Types: {', '.join(explanation['detected_intent']['event_types']) or 'None detected'}")
+        print(f"  Filters: {explanation['detected_intent']['filters']}")
+        print(f"  Target Index: {explanation['target_index']}")
+        print(f"  Estimated Cost: {explanation['estimated_cost']}")
+        print(f"\n  KQL Equivalent: {explanation['kql_equivalent']}")
+    
+    def _generate_report(self, query: str):
+        """Generate a report"""
+        print("\nGenerating report...", end='', flush=True)
+        
+        report = self.assistant.generate_report(query, output_format='text')
+        
+        print("\r" + " " * 30 + "\r", end='')  # Clear status
+        print(report)
+    
+    def _show_history(self):
+        """Show conversation history"""
+        history = self.assistant.get_conversation_history()
+        
+        if not history:
+            print("No conversation history")
+            return
+        
+        print("\nConversation History:")
+        for i, entry in enumerate(history, 1):
+            print(f"\n{i}. {entry['timestamp']}")
+            print(f"   Action: {entry['action']}")
+            print(f"   Event Types: {entry['entities'].get('event_types', [])}")
+    
+    def _show_health(self):
+        """Show system health"""
+        health = self.assistant.health_check()
+        
+        print(f"\nSystem Health: {health['overall'].upper()}")
+        print("\nComponents:")
+        for component, status in health['components'].items():
+            icon = "✓" if status == 'healthy' else "✗"
+            print(f"  {icon} {component}: {status}")
+    
+    def _show_help(self):
+        """Show help message"""
+        print("\nAvailable Commands:")
+        print("  Natural language queries:")
+        print("    - 'Show me failed login attempts from yesterday'")
+        print("    - 'How many malware detections last week?'")
+        print("    - 'List VPN connections from user john.doe'")
+        print("\n  Special commands:")
+        print("    - explain <query>  - Explain query processing")
+        print("    - report <query>   - Generate comprehensive report")
+        print("    - clear           - Clear conversation context")
+        print("    - history         - Show conversation history")
+        print("    - health          - Check system health")
+        print("    - exit/quit       - Exit the assistant")
+    
+    def stop(self):
+        """Stop the session"""
+        self.running = False
+        self.assistant.close()
+
+
+# --- Sample Log Ingestion (Run this once to populate ES with demo logs) ---
+def ingest_sample_logs(es_client: Elasticsearch, num_logs: int = 50):
+    """Ingest sample security event logs into Elasticsearch for demo purposes"""
+    sample_events = [
+        {
+            "@timestamp": "2025-10-13T10:00:00Z",
+            "event": {
+                "action": "login_failure",
+                "category": "authentication",
+                "outcome": "failure"
+            },
+            "user": {"name": "john.doe"},
+            "host": {"name": "workstation-1"},
+            "source": {"ip": "192.168.1.100"},
+            "message": "Failed login attempt from suspicious IP"
+        },
+        {
+            "@timestamp": "2025-10-13T11:30:00Z",
+            "event": {
+                "action": "login_success",
+                "category": "authentication",
+                "outcome": "success"
+            },
+            "user": {"name": "jane.smith"},
+            "host": {"name": "server-2"},
+            "source": {"ip": "10.0.0.50"},
+            "message": "Successful VPN login"
+        },
+        {
+            "@timestamp": "2025-10-13T14:20:00Z",
+            "event": {
+                "category": "malware",
+                "kind": "threat",
+                "severity": "high"
+            },
+            "file": {"name": "malware.exe"},
+            "host": {"name": "workstation-1"},
+            "message": "Malware detected and quarantined"
+        },
+        # Add more sample templates as needed
+    ]
+    
+    # Generate variations
+    logs = []
+    for i in range(num_logs):
+        event = sample_events[i % len(sample_events)].copy()
+        event["@timestamp"] = (datetime.now() - timedelta(hours=i)).isoformat()
+        event["message"] += f" - Log #{i+1}"
+        logs.append(event)
+    
+    try:
+        for log in logs:
+            es_client.index(index="logs-2025.10.13", body=log)
+        logger.info(f"Ingested {num_logs} sample logs into 'logs-2025.10.13'")
+    except Exception as e:
+        logger.error(f"Failed to ingest sample logs: {e}")
+
+
+# --- Main Entry Point ---
+if __name__ == "__main__":
+    # Optional: Ingest sample logs if running in demo mode
+    if len(sys.argv) > 1 and sys.argv[1] == 'ingest':
+        try:
+            es = Elasticsearch(['http://localhost:9200'])
+            ingest_sample_logs(es)
+            print("Sample logs ingested successfully!")
+        except Exception as e:
+            print(f"Failed to ingest logs: {e}")
+        sys.exit(0)
+    
+    # Check if running in interactive mode
+    if len(sys.argv) > 1 and sys.argv[1] == 'interactive':
+        session = InteractiveSession()
+        try:
+            session.start()
+        finally:
+            session.stop()
+    else:
+        # Example programmatic usage
+        with SIEMAssistant() as assistant:
+            # Check health
+            health = assistant.health_check()
+            print(f"System Health: {health['overall']}")
+            
+            # Example queries
+            queries = [
+                "Show me failed login attempts from yesterday",
+                "How many malware detections in the last week?",
+                "Generate a report of security alerts from last month"
+            ]
+            
+            for query in queries:
+                print(f"\nQuery: {query}")
+                response = assistant.ask(query)
+                print(f"Response: {response.get('text', 'No text')}")

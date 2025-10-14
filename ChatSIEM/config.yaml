@@ -1,0 +1,74 @@
+# config.yaml - Configuration for SIEM Assistant
+# This config is tailored for Elastic SIEM with sample schema mappings
+# Adjust hosts, credentials, etc. based on your setup
+
+siem:
+  type: elastic  # 'elastic' or 'wazuh'
+  host: localhost
+  port: 9200
+  scheme: http
+  username: ""  # Empty for security disabled in docker-compose
+  password: ""
+  verify_certs: false
+  wazuh_api_url: ""  # For Wazuh, if applicable
+  indices:
+    security_events: "logs-*"
+    endpoint_security: "logs-*"
+    network_traffic: "packetbeat-*"
+    alerts: ".alerts-*"
+
+schema:
+  # Sample schema mappings for common security events
+  # Each entity maps to Elasticsearch field conditions
+  failed_login:
+    conditions:
+      event.action: ["login_failure", "authentication_failure"]
+      event.category: "authentication"
+  successful_login:
+    conditions:
+      event.action: ["login_success", "authentication_success"]
+      event.outcome: "success"
+  malware:
+    conditions:
+      event.category: "malware"
+      event.kind: "threat"
+  network_connection:
+    conditions:
+      event.category: ["network", "connection"]
+      network.direction: ["inbound", "outbound"]
+  vpn:
+    conditions:
+      service.name: "vpn"
+      network.protocol: "ipsec"
+  firewall:
+    conditions:
+      event.category: "firewall"
+      event.outcome: "denied"
+  user_activity:
+    conditions:
+      event.category: ["process", "file"]
+  alerts:
+    conditions:
+      event.kind: "alert"
+  process:
+    conditions:
+      event.category: "process"
+  file_operation:
+    conditions:
+      event.category: "file"
+
+time_ranges:
+  # Predefined time ranges for natural language parsing
+  # Keys should be phrases users might say
+  yesterday: "now-1d/d"
+  today: "now/d"
+  last week: "now-7d/d"
+  last 24 hours: "now-24h"
+  past month: "now-30d/d"
+  last hour: "now-1h"
+
+limits:
+  # Query limits for performance and safety
+  default_size: 100
+  max_results: 10000
+  aggregation_size: 50
